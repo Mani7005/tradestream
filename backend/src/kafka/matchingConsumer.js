@@ -1,18 +1,19 @@
-import { createConsumer, TOPICS, publishTrade, publishAudit } from "./client.js";
+import { createConsumer, TOPICS, publishTrade, publishAudit, USE_KAFKA } from "./client.js";
+import { localBus } from "./localBus.js";
 import { MatchingEngine } from "../matchingEngine/matchingEngine.js";
 import { pool } from "../db.js";
 import { applyTradeToPortfolios } from "../services/portfolioService.js";
 
 /**
- * Starts the consumer group that owns the matching engine. In a real exchange this would
- * be sharded by symbol; here a single consumer instance processes the `orders` topic
- * in order, which is sufficient for a simulator and keeps matching deterministic.
+ * Starts the consumer that owns the matching engine. In a real exchange this would be
+ * sharded by symbol; here a single consumer instance processes the `orders` topic in
+ * order, which is sufficient for a simulator and keeps matching deterministic.
+ *
+ * Transparently runs against either a real Kafka topic (when KAFKA_BROKERS is set) or
+ * the in-process localBus fallback (free-tier deployments without a managed broker).
+ * The matching engine itself doesn't know or care which transport delivered the order.
  */
 export async function startMatchingConsumer(io) {
-  const consumer = createConsumer("matching-engine-group");
-  await consumer.connect();
-  await consumer.subscribe({ topic: TOPICS.ORDERS, fromBeginning: false });
-
   const engine = new MatchingEngine({
     onTrade: async (trade) => {
       const result = await pool.query(
@@ -41,6 +42,22 @@ export async function startMatchingConsumer(io) {
       io.emit("order:update", patch);
     },
   });
+
+  if (!USE_KAFKA) {
+    localBus.subscribe(TOPICS.ORDERS, async (order) => {
+      try {
+        await engine.processOrder(order);
+      } catch (err) {
+        console.error("[matching-engine] failed to process order:", err);
+      }
+    });
+    console.log("[event-bus] matching engine subscribed via in-process bus");
+    return null;
+  }
+
+  const consumer = createConsumer("matching-engine-group");
+  await consumer.connect();
+  await consumer.subscribe({ topic: TOPICS.ORDERS, fromBeginning: false });
 
   await consumer.run({
     eachMessage: async ({ message }) => {
